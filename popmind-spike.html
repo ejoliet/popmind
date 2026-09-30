@@ -1,0 +1,806 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>popmind spike — plate survey of your browsing</title>
+<!--
+  AIDEV-SPIKE: popmind import + semantic map, single file, no build step.
+  Purpose: settle A3 (is title+host enough signal to cluster real history?)
+  against Emmanuel's OWN history file, and prove the import path works for
+  Chrome / Firefox / Safari from the exported SQLite alone.
+
+  Two external deps only, both loose-ranged to survive patch churn:
+    sql.js            reads the history SQLite in-browser
+    transformers.js   MiniLM-L6-v2 embeddings, WebGPU, on-device
+  kNN, 2D layout, k-means and silhouette are implemented here on purpose:
+  fewer CDN failure points, and the lexical fallback keeps the whole pipeline
+  working end-to-end even if the model download is blocked. That fallback is
+  also the A/B control — lexical floor vs embeddings, same plate, same metric.
+
+  Nothing leaves the tab. No fetch of user data, no storage writes.
+-->
+<script src="https://cdn.jsdelivr.net/npm/sql.js@1/dist/sql-wasm.js"></script>
+<style>
+  :root{
+    /* Palette: astronomical glass plate. Survey plates are negatives —
+       pale ground, dark ink. Cluster hues are photographic filter bands. */
+    --plate:      #DEDDD4;
+    --plate-deep: #CFCEC3;
+    --ink:        #17181A;
+    --ink-soft:   #5C5E5C;
+    --rule:       #B4B3A7;
+    --emulsion:   #F1F0E8;
+    --band-0:#5B4FCF; --band-1:#2F7D5A; --band-2:#B5442E; --band-3:#1C6E8C;
+    --band-4:#8A5A1E; --band-5:#7A3E6B; --band-6:#4A6B22; --band-7:#A03A5C;
+    --band-8:#2B5AA8; --band-9:#946A16; --band-10:#3C7C77; --band-11:#6B4A2A;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{
+    background:var(--plate); color:var(--ink);
+    font:400 13px/1.5 var(--sans);
+    -webkit-font-smoothing:antialiased;
+  }
+  /* ---- plate margin: the signature. The whole app sits inside a scanned
+         plate holder, with fiducial corner marks and a typed exposure log. */
+  .holder{
+    height:100%; padding:14px; display:grid; gap:12px;
+    grid-template-rows:auto 1fr auto;
+    grid-template-columns:1fr;
+  }
+  .plate-frame{position:relative; border:1px solid var(--rule); background:var(--emulsion)}
+  .fid{position:absolute;width:11px;height:11px;pointer-events:none}
+  .fid::before,.fid::after{content:"";position:absolute;background:var(--ink)}
+  .fid::before{left:0;top:5px;width:11px;height:1px}
+  .fid::after{left:5px;top:0;width:1px;height:11px}
+  .fid.tl{left:-6px;top:-6px}.fid.tr{right:-6px;top:-6px}
+  .fid.bl{left:-6px;bottom:-6px}.fid.br{right:-6px;bottom:-6px}
+
+  header{display:flex;align-items:baseline;gap:18px;flex-wrap:wrap}
+  h1{
+    font:400 19px/1 var(--mono); letter-spacing:.28em; text-transform:lowercase;
+    margin:0;
+  }
+  .sub{font:400 11px/1.4 var(--mono);color:var(--ink-soft);letter-spacing:.06em}
+
+  main{display:grid;grid-template-columns:1fr 320px;gap:12px;min-height:0}
+  @media (max-width:880px){main{grid-template-columns:1fr;grid-template-rows:1fr auto}}
+
+  #plate{display:block;width:100%;height:100%;cursor:crosshair}
+  .stage{position:relative;min-height:0}
+
+  aside{display:flex;flex-direction:column;gap:10px;min-height:0;overflow:auto}
+  .card{border:1px solid var(--rule);background:var(--emulsion);padding:10px 11px}
+  .card h2{
+    font:400 10px/1 var(--mono);letter-spacing:.18em;text-transform:uppercase;
+    color:var(--ink-soft);margin:0 0 8px
+  }
+  .log{font:400 11px/1.75 var(--mono);white-space:pre-wrap;word-break:break-word}
+  .log b{font-weight:400;border-bottom:1px solid var(--rule)}
+  .kv{display:grid;grid-template-columns:auto 1fr;gap:0 10px;font:400 11px/1.8 var(--mono)}
+  .kv span:nth-child(odd){color:var(--ink-soft)}
+  .kv span:nth-child(even){text-align:right}
+
+  /* ---- controls: instrument panel, all monospace, no rounded corners */
+  .panel{display:flex;gap:14px;align-items:center;flex-wrap:wrap;
+         font:400 11px/1 var(--mono);letter-spacing:.04em}
+  label.f{display:flex;gap:6px;align-items:center;color:var(--ink-soft)}
+  select,input[type=number],button{
+    font:400 11px/1 var(--mono);color:var(--ink);background:var(--emulsion);
+    border:1px solid var(--rule);padding:6px 8px
+  }
+  button{cursor:pointer;letter-spacing:.1em;text-transform:uppercase}
+  button:hover:not(:disabled){background:var(--plate-deep)}
+  button:disabled{color:var(--ink-soft);cursor:not-allowed}
+  :focus-visible{outline:2px solid var(--band-0);outline-offset:2px}
+
+  /* ---- dropzone doubles as the empty state: an invitation, with the exact
+         shell command for each browser so nobody hunts for the file. */
+  #drop{
+    position:absolute;inset:0;display:grid;place-items:center;padding:24px;
+    background:var(--emulsion);
+  }
+  #drop.over{background:var(--plate-deep)}
+  .dz{max-width:560px}
+  .dz p{margin:0 0 14px;font-size:13px;max-width:52ch}
+  .dz pre{
+    font:400 11px/1.8 var(--mono);background:var(--plate);border:1px solid var(--rule);
+    padding:9px 11px;margin:0 0 8px;overflow-x:auto
+  }
+  .dz .hint{font:400 10px/1.6 var(--mono);color:var(--ink-soft);letter-spacing:.04em}
+
+  #tip{
+    position:absolute;pointer-events:none;max-width:330px;padding:7px 9px;
+    background:var(--ink);color:var(--emulsion);font:400 11px/1.45 var(--mono);
+    opacity:0;transition:opacity .08s
+  }
+  #tip .h{color:#B9B7A8}
+  #stream{width:100%;height:118px;display:block}
+  .swatch{display:inline-block;width:8px;height:8px;margin-right:6px;vertical-align:-1px}
+  .cl{display:block;width:100%;text-align:left;border:0;background:none;padding:2px 0;
+      font:400 11px/1.6 var(--mono);cursor:pointer;color:var(--ink)}
+  .cl:hover{background:var(--plate-deep)}
+  .cl.dim{opacity:.38}
+  .trail{font:400 11px/1.7 var(--mono)}
+  .trail li{margin:0 0 2px}
+  .trail ol{margin:0;padding-left:18px}
+  .err{color:var(--band-2)}
+  @media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+</head>
+<body>
+<div class="holder">
+  <header>
+    <h1>popmind</h1>
+    <span class="sub">plate survey of your own browsing · everything stays in this tab</span>
+  </header>
+
+  <main>
+    <div class="stage plate-frame">
+      <i class="fid tl"></i><i class="fid tr"></i><i class="fid bl"></i><i class="fid br"></i>
+      <canvas id="plate"></canvas>
+      <div id="tip"></div>
+      <div id="drop">
+        <div class="dz">
+          <p><b>Drop a browser history file here.</b> Any browser, any OS. Copy it first —
+             browsers keep the file locked while running.</p>
+          <pre>cp ~/Library/Application\ Support/Google/Chrome/Default/History ~/Desktop/     # Chrome, macOS
+cp ~/.config/google-chrome/Default/History ~/Desktop/                          # Chrome, Linux
+cp ~/Library/Safari/History.db ~/Desktop/                                      # Safari
+cp ~/Library/Application\ Support/Firefox/Profiles/*.default*/places.sqlite ~/ # Firefox, macOS
+cp ~/.mozilla/firefox/*.default*/places.sqlite ~/                              # Firefox, Linux</pre>
+          <div class="hint">Edge · Brave · Arc · Vivaldi use Chrome's schema — same file name, different profile path.</div>
+          <p style="margin-top:16px"><button id="pick">choose file</button>
+             <input id="file" type="file" hidden></p>
+        </div>
+      </div>
+    </div>
+
+    <aside>
+      <div class="card">
+        <h2>exposure log</h2>
+        <div class="log" id="explog">awaiting plate.</div>
+      </div>
+      <div class="card">
+        <h2>measurements</h2>
+        <div class="kv" id="metrics"><span>—</span><span></span></div>
+      </div>
+      <div class="card">
+        <h2>fields</h2>
+        <div id="clusters" class="log">—</div>
+      </div>
+      <div class="card">
+        <h2>selection</h2>
+        <div id="detail" class="trail">Click a point to read its trail.</div>
+      </div>
+    </aside>
+  </main>
+
+  <div class="plate-frame" style="padding:8px 10px">
+    <div class="panel" style="margin-bottom:6px">
+      <label class="f">emulsion
+        <select id="vec">
+          <option value="minilm">MiniLM-L6-v2 (on-device)</option>
+          <option value="lexical">lexical char-ngram (control)</option>
+        </select>
+      </label>
+      <label class="f">fields <input id="k" type="number" min="4" max="12" value="10" style="width:56px"></label>
+      <label class="f">sample cap <input id="cap" type="number" min="500" max="20000" step="500" value="4000" style="width:74px"></label>
+      <button id="run" disabled>develop plate</button>
+      <span class="sub" id="stage">—</span>
+    </div>
+    <svg id="stream"></svg>
+  </div>
+</div>
+
+<script type="module">
+// ─────────────────────────────────────────────────────────── plumbing
+const $ = s => document.querySelector(s);
+const el = { plate:$('#plate'), tip:$('#tip'), drop:$('#drop'), explog:$('#explog'),
+             metrics:$('#metrics'), clusters:$('#clusters'), detail:$('#detail'),
+             stage:$('#stage'), stream:$('#stream') };
+const BANDS = [...Array(12)].map((_,i)=>getComputedStyle(document.documentElement)
+  .getPropertyValue(`--band-${i}`).trim());
+const nf = n => n.toLocaleString('en-US');
+const say = s => { el.stage.textContent = s; };
+const yieldUI = () => new Promise(r => setTimeout(r, 0));
+const t0 = () => performance.now();
+
+let S = null;   // full state after a successful develop
+
+// ─────────────────────────────────────────── 1. read + normalize the file
+// One SQL shape per browser. All three validated offline in validate.py:
+// epoch drift 0 ms, and the three normalize to byte-identical rows.
+const FLAVORS = [
+  { name:'Chrome-family', need:['urls','visits'], sql:`
+      SELECT u.url, u.title, v.visit_time/1000 - 11644473600000 AS ts,
+             v.id AS vid, NULLIF(v.from_visit,0) AS src
+      FROM visits v JOIN urls u ON u.id = v.url
+      WHERE u.title IS NOT NULL AND u.title <> '' ORDER BY ts` },
+  { name:'Firefox', need:['moz_places','moz_historyvisits'], sql:`
+      SELECT p.url, p.title, v.visit_date/1000 AS ts,
+             v.id AS vid, NULLIF(v.from_visit,0) AS src
+      FROM moz_historyvisits v JOIN moz_places p ON p.id = v.place_id
+      WHERE p.title IS NOT NULL AND p.title <> '' ORDER BY ts` },
+  { name:'Safari', need:['history_items','history_visits'], sql:`
+      SELECT i.url, v.title, CAST((v.visit_time + 978307200)*1000 AS INTEGER) AS ts,
+             v.id AS vid, v.redirect_source AS src
+      FROM history_visits v JOIN history_items i ON i.id = v.history_item
+      WHERE v.title IS NOT NULL AND v.title <> '' ORDER BY ts` },
+];
+
+let SQL = null;
+async function sqlEngine(){
+  if (SQL) return SQL;
+  if (typeof initSqlJs !== 'function')
+    throw new Error('sql.js did not load. Check the network tab for cdn.jsdelivr.net.');
+  SQL = await initSqlJs({ locateFile: f => `https://cdn.jsdelivr.net/npm/sql.js@1/dist/${f}` });
+  return SQL;
+}
+
+async function readHistory(file){
+  const engine = await sqlEngine();
+  const db = new engine.Database(new Uint8Array(await file.arrayBuffer()));
+  const have = new Set(db.exec(`SELECT name FROM sqlite_master WHERE type='table'`)
+    .flatMap(r => r.values.map(v => v[0])));
+  const flavor = FLAVORS.find(f => f.need.every(t => have.has(t)));
+  if (!flavor) throw new Error(
+    `Not a browser history database. Tables found: ${[...have].slice(0,6).join(', ') || 'none'}.`);
+
+  const res = db.exec(flavor.sql)[0];
+  if (!res) throw new Error(`${flavor.name} schema recognised, but it holds no titled visits.`);
+  const visits = res.values.map(([url,title,ts,vid,src]) =>
+    ({ url, title, ts:Number(ts), vid:Number(vid), src: src==null?null:Number(src) }));
+  db.close();
+
+  // Collapse visits to pages. Embed each URL once; keep visit stats + first/last.
+  const pages = new Map();
+  for (const v of visits){
+    let p = pages.get(v.url);
+    if (!p) pages.set(v.url, p = { url:v.url, title:v.title, host:hostOf(v.url),
+                                   n:0, first:v.ts, last:v.ts });
+    p.n++; p.first = Math.min(p.first, v.ts); p.last = Math.max(p.last, v.ts);
+    if (v.title.length > p.title.length) p.title = v.title;   // longest title wins
+  }
+  return { flavor:flavor.name, visits, pages:[...pages.values()] };
+}
+
+const hostOf = u => { try { return new URL(u).hostname.replace(/^www\./,''); }
+                      catch { return '·'; } };
+
+// Sessions: real from_visit chains where the browser records them, 30-minute
+// inactivity gaps otherwise (Safari). Both usable — proven in validate.py A4.
+function sessionize(visits){
+  const byId = new Map(visits.map(v => [v.vid, v]));
+  const root = new Map();
+  const findRoot = v => {
+    let cur = v, hops = 0;
+    while (cur.src && byId.has(cur.src) && hops++ < 64) cur = byId.get(cur.src);
+    return cur.vid;
+  };
+  const chained = visits.some(v => v.src);
+  const GAP = 30*60*1000;
+  let bucket = 0, prev = null;
+  const sessions = new Map();
+  for (const v of visits){
+    let key;
+    if (chained) key = 'c' + (root.get(v.vid) ?? findRoot(v));
+    else { if (prev !== null && v.ts - prev > GAP) bucket++; key = 'g' + bucket; prev = v.ts; }
+    if (!sessions.has(key)) sessions.set(key, []);
+    sessions.get(key).push(v);
+  }
+  const urlToSession = new Map();
+  for (const [key, list] of sessions)
+    for (const v of list) if (!urlToSession.has(v.url)) urlToSession.set(v.url, key);
+  return { sessions, urlToSession, mode: chained ? 'from_visit chains' : '30-min gaps' };
+}
+
+// ─────────────────────────────────────────────────── 2. vectorize titles
+const STOP = new Set(`a an and are as at be by for from has how i in is it of on or that the to
+  with you your what why when which via using use guide docs doc documentation home page com www`
+  .split(/\s+/));
+const tokens = p => `${p.title} ${p.host.replace(/[.-]/g,' ')}`
+  .toLowerCase().match(/[a-z][a-z0-9+#._-]{1,}/g)?.filter(t => !STOP.has(t) && t.length>1) ?? [];
+
+/* Control arm: hashed char 3–5 grams, signed, L2-normalized. No download, no
+   model. validate.py shows lexical methods top out around ARI 0.6 on short
+   titles — the point of shipping it is to see that gap on real data. */
+function lexicalVectors(pages, dim = 256){
+  const V = new Float32Array(pages.length * dim);
+  pages.forEach((p, i) => {
+    const s = ` ${p.title.toLowerCase()} ${p.host.toLowerCase()} `;
+    const off = i * dim;
+    for (let n = 3; n <= 5; n++)
+      for (let j = 0; j + n <= s.length; j++){
+        let h = 2166136261;
+        for (let c = j; c < j + n; c++) h = (h ^ s.charCodeAt(c)) * 16777619 >>> 0;
+        V[off + (h % dim)] += (h & 1024) ? 1 : -1;
+      }
+    let m = 0; for (let d = 0; d < dim; d++) m += V[off+d]**2;
+    m = Math.sqrt(m) || 1; for (let d = 0; d < dim; d++) V[off+d] /= m;
+  });
+  return { V, dim, label:'lexical char3-5 hashed(256)' };
+}
+
+async function minilmVectors(pages, onProgress){
+  const mod = await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@3/dist/transformers.min.js');
+  const hasGPU = !!navigator.gpu;
+  const pipe = await mod.pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2',
+    { device: hasGPU ? 'webgpu' : 'wasm', dtype: hasGPU ? 'fp32' : 'q8' });
+  const dim = 384, B = hasGPU ? 128 : 32;
+  const V = new Float32Array(pages.length * dim);
+  for (let i = 0; i < pages.length; i += B){
+    const batch = pages.slice(i, i+B).map(p => `${p.title} — ${p.host}`);
+    const out = await pipe(batch, { pooling:'mean', normalize:true });
+    V.set(out.data.slice(0, batch.length*dim), i*dim);
+    onProgress(Math.min(i+B, pages.length));
+    await yieldUI();
+  }
+  return { V, dim, label:`MiniLM-L6-v2 · ${hasGPU ? 'WebGPU' : 'WASM'}` };
+}
+
+// ─────────────────────────── 3. kNN + 2D layout (UMAP-lite, implemented here)
+function randomProject(V, n, dim, out = 64){
+  // Johnson–Lindenstrauss: cheap dimension cut so exact kNN stays interactive.
+  const R = new Float32Array(dim * out);
+  let s = 22222;
+  const rnd = () => (s = (s*1103515245 + 12345) & 0x7fffffff) / 0x7fffffff - 0.5;
+  for (let i = 0; i < R.length; i++) R[i] = rnd();
+  const P = new Float32Array(n * out);
+  for (let i = 0; i < n; i++)
+    for (let d = 0; d < out; d++){
+      let a = 0;
+      for (let j = 0; j < dim; j++) a += V[i*dim+j] * R[j*out+d];
+      P[i*out+d] = a;
+    }
+  for (let i = 0; i < n; i++){
+    let m = 0; for (let d = 0; d < out; d++) m += P[i*out+d]**2;
+    m = Math.sqrt(m) || 1; for (let d = 0; d < out; d++) P[i*out+d] /= m;
+  }
+  return P;
+}
+
+async function knn(P, n, d, K, onProgress){
+  const idx = new Int32Array(n*K), dist = new Float32Array(n*K);
+  const bs = new Float32Array(K), bi = new Int32Array(K);
+  for (let i = 0; i < n; i++){
+    bs.fill(-2); bi.fill(-1);
+    for (let j = 0; j < n; j++){
+      if (j === i) continue;
+      let s = 0;
+      for (let t = 0; t < d; t++) s += P[i*d+t]*P[j*d+t];
+      if (s <= bs[K-1]) continue;
+      let k = K-1;
+      while (k > 0 && bs[k-1] < s){ bs[k]=bs[k-1]; bi[k]=bi[k-1]; k--; }
+      bs[k]=s; bi[k]=j;
+    }
+    idx.set(bi, i*K); dist.set(bs, i*K);
+    if ((i & 511) === 0){ onProgress(i); await yieldUI(); }
+  }
+  return { idx, dist, K };
+}
+
+/* Attractive/repulsive SGD in 2D over the kNN graph. Same family as UMAP's
+   optimizer, ~40 lines, and it removes a third CDN dependency. Emits after
+   each epoch so the plate visibly develops. */
+async function layout(nb, n, epochs, onEpoch){
+  const { idx, dist, K } = nb;
+  const X = new Float32Array(n*2);
+  let s = 987654321;
+  const rnd = () => (s = (s*1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+  for (let i = 0; i < n*2; i++) X[i] = (rnd()-0.5) * 10;
+  // Edge weights: sharpen similarity so weak neighbours pull less.
+  const W = new Float32Array(n*K);
+  for (let i = 0; i < n*K; i++) W[i] = Math.max(0, dist[i]) ** 3;
+
+  for (let e = 0; e < epochs; e++){
+    const alpha = 1.0 * (1 - e/epochs) + 0.02;
+    for (let i = 0; i < n; i++){
+      for (let k = 0; k < K; k++){
+        const j = idx[i*K+k]; if (j < 0) continue;
+        const w = W[i*K+k]; if (w < 1e-3) continue;
+        let dx = X[i*2]-X[j*2], dy = X[i*2+1]-X[j*2+1];
+        const d2 = dx*dx+dy*dy+1e-6;
+        const g = (-2*w*alpha) / (1+d2);
+        dx*=g; dy*=g;
+        X[i*2]+=dx; X[i*2+1]+=dy; X[j*2]-=dx; X[j*2+1]-=dy;
+        // one negative sample per positive
+        const r = (rnd()*n)|0; if (r===i) continue;
+        let rx = X[i*2]-X[r*2], ry = X[i*2+1]-X[r*2+1];
+        const r2 = rx*rx+ry*ry+1e-6;
+        const rg = (2*alpha) / ((0.001+r2)*(1+r2));
+        X[i*2]+=rx*rg; X[i*2+1]+=ry*rg;
+      }
+    }
+    onEpoch(e, X);
+    await yieldUI();
+  }
+  return X;
+}
+
+// ───────────────────────────────────────────────── 4. clusters + labels
+function kmeans(V, n, d, k, iters = 25){
+  const C = new Float32Array(k*d), lab = new Int32Array(n).fill(-1);
+  let s = 1234567;
+  const rnd = () => (s = (s*1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+  // k-means++ seeding keeps fields from collapsing onto each other
+  let first = (rnd()*n)|0;
+  C.set(V.subarray(first*d,(first+1)*d), 0);
+  const near = new Float32Array(n).fill(Infinity);
+  for (let c = 1; c < k; c++){
+    let sum = 0;
+    for (let i = 0; i < n; i++){
+      let dot = 0; for (let t=0;t<d;t++) dot += V[i*d+t]*C[(c-1)*d+t];
+      near[i] = Math.min(near[i], 1-dot); sum += near[i];
+    }
+    let pick = rnd()*sum, j = 0;
+    while (j < n-1 && (pick -= near[j]) > 0) j++;
+    C.set(V.subarray(j*d,(j+1)*d), c*d);
+  }
+  for (let it = 0; it < iters; it++){
+    let moved = 0;
+    for (let i = 0; i < n; i++){
+      let best = 0, bs = -2;
+      for (let c = 0; c < k; c++){
+        let dot = 0; for (let t=0;t<d;t++) dot += V[i*d+t]*C[c*d+t];
+        if (dot > bs){ bs = dot; best = c; }
+      }
+      if (lab[i] !== best){ lab[i] = best; moved++; }
+    }
+    C.fill(0);
+    const cnt = new Int32Array(k);
+    for (let i = 0; i < n; i++){ cnt[lab[i]]++; for (let t=0;t<d;t++) C[lab[i]*d+t]+=V[i*d+t]; }
+    for (let c = 0; c < k; c++){
+      let m = 0; for (let t=0;t<d;t++) m += C[c*d+t]**2;
+      m = Math.sqrt(m) || 1; for (let t=0;t<d;t++) C[c*d+t] /= m;
+    }
+    if (!moved) break;
+  }
+  return lab;
+}
+
+/* Host tokens are strong clustering signal but weak *labels* — core_test.mjs
+   showed fields naming themselves "readthedocs · mozilla · ncbi", which tells
+   you nothing about the topic. Penalise them so titles win the name. */
+const HOST_PENALTY = 0.35;
+function labelClusters(pages, lab, k){
+  const df = new Map(), tf = [...Array(k)].map(()=>new Map());
+  const hostTok = new Set();
+  pages.forEach((p,i) => {
+    for (const h of p.host.toLowerCase().split(/[.-]/)) if (h.length>1) hostTok.add(h);
+    const seen = new Set(tokens(p));
+    for (const t of seen){
+      df.set(t,(df.get(t)||0)+1);
+      tf[lab[i]].set(t,(tf[lab[i]].get(t)||0)+1);
+    }
+  });
+  const GENERIC = new Set(['io','org','net','readthedocs','github','stackoverflow',
+    'medium','reddit','wikipedia','google','youtube','html','pdf','index','en','us']);
+  const N = pages.length;
+  return tf.map((m, c) => {
+    const size = lab.reduce((a,l)=>a+(l===c?1:0),0) || 1;
+    const scored = [...m].filter(([t,n]) => n >= Math.max(2, size*0.08) && !GENERIC.has(t))
+      .map(([t,n]) => [t, (n/size) * Math.log(N/(df.get(t)||1))
+                          * (hostTok.has(t) ? HOST_PENALTY : 1)])
+      .sort((a,b)=>b[1]-a[1]).slice(0,3).map(([t])=>t);
+    return { terms: scored.length ? scored : ['(mixed)'], size };
+  });
+}
+
+// Cosine silhouette on a sample — the number that answers A3.
+function silhouette(V, n, d, lab, k, sample = 1200){
+  const step = Math.max(1, Math.floor(n/sample));
+  const pick = []; for (let i = 0; i < n; i += step) pick.push(i);
+  let total = 0, used = 0;
+  for (const i of pick){
+    const sums = new Float64Array(k), cnts = new Int32Array(k);
+    for (const j of pick){
+      if (i === j) continue;
+      let dot = 0; for (let t=0;t<d;t++) dot += V[i*d+t]*V[j*d+t];
+      sums[lab[j]] += 1-dot; cnts[lab[j]]++;
+    }
+    if (!cnts[lab[i]]) continue;
+    const a = sums[lab[i]]/cnts[lab[i]];
+    let b = Infinity;
+    for (let c = 0; c < k; c++) if (c !== lab[i] && cnts[c]) b = Math.min(b, sums[c]/cnts[c]);
+    if (!isFinite(b)) continue;
+    total += (b-a)/Math.max(a,b); used++;
+  }
+  return used ? total/used : NaN;
+}
+
+// ────────────────────────────────────────────────────────── 5. render
+const view = { x:0, y:0, z:1, w:0, h:0 };
+let hidden = new Set(), hoverI = -1, selI = -1;
+
+function fitView(X, n){
+  let x0=Infinity,y0=Infinity,x1=-Infinity,y1=-Infinity;
+  for (let i=0;i<n;i++){ x0=Math.min(x0,X[i*2]); x1=Math.max(x1,X[i*2]);
+                         y0=Math.min(y0,X[i*2+1]); y1=Math.max(y1,X[i*2+1]); }
+  const pad = 34;
+  const sx = (view.w-2*pad)/Math.max(1e-6,x1-x0), sy = (view.h-2*pad)/Math.max(1e-6,y1-y0);
+  view.base = Math.min(sx,sy);
+  view.cx = (x0+x1)/2; view.cy = (y0+y1)/2;
+}
+const toScreen = (X,i) => [
+  view.w/2 + (X[i*2]-view.cx)*view.base*view.z + view.x,
+  view.h/2 + (X[i*2+1]-view.cy)*view.base*view.z + view.y ];
+
+function draw(){
+  const c = el.plate, g = c.getContext('2d'), dpr = devicePixelRatio||1;
+  if (c.width !== c.clientWidth*dpr || c.height !== c.clientHeight*dpr){
+    c.width = c.clientWidth*dpr; c.height = c.clientHeight*dpr;
+    view.w = c.clientWidth; view.h = c.clientHeight;
+    if (S) fitView(S.X, S.n);
+  }
+  g.setTransform(dpr,0,0,dpr,0,0);
+  g.clearRect(0,0,view.w,view.h);
+  if (!S) return;
+  const { X, n, lab, pages, revealed } = S;
+
+  g.globalAlpha = 1;
+  for (let i = 0; i < Math.min(n, revealed); i++){
+    if (hidden.has(lab[i])) continue;
+    const [sx,sy] = toScreen(X,i);
+    if (sx < -8 || sy < -8 || sx > view.w+8 || sy > view.h+8) continue;
+    const r = Math.min(5.5, 1.5 + Math.log2(1+pages[i].n)*0.85) * Math.min(2, view.z**0.35);
+    g.fillStyle = BANDS[lab[i] % BANDS.length];
+    g.globalAlpha = i === selI ? 1 : 0.72;
+    g.beginPath(); g.arc(sx,sy,r,0,6.2832); g.fill();
+  }
+  for (const i of [selI, hoverI]){
+    if (i < 0 || i >= n) continue;
+    const [sx,sy] = toScreen(X,i);
+    g.globalAlpha = 1; g.strokeStyle = 'var(--ink)';
+    g.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue('--ink').trim();
+    g.lineWidth = 1; g.beginPath(); g.arc(sx,sy,9,0,6.2832); g.stroke();
+  }
+  // plate scale bar, bottom-left of the frame
+  g.globalAlpha = 1; g.fillStyle = getComputedStyle(document.documentElement)
+    .getPropertyValue('--ink-soft').trim();
+  g.font = '10px ui-monospace, monospace';
+  g.fillText(`${nf(S.n)} pages · ${(view.z).toFixed(1)}×`, 10, view.h-10);
+}
+
+function nearest(mx,my){
+  if (!S) return -1;
+  let best = -1, bd = 400;
+  for (let i = 0; i < Math.min(S.n, S.revealed); i++){
+    if (hidden.has(S.lab[i])) continue;
+    const [sx,sy] = toScreen(S.X,i);
+    const d = (sx-mx)**2 + (sy-my)**2;
+    if (d < bd){ bd = d; best = i; }
+  }
+  return best;
+}
+
+function renderClusters(){
+  const { labels, lab, n } = S;
+  el.clusters.innerHTML = '';
+  labels.map((L,c)=>({...L,c})).sort((a,b)=>b.size-a.size).forEach(L => {
+    const b = document.createElement('button');
+    b.className = 'cl' + (hidden.has(L.c) ? ' dim' : '');
+    b.innerHTML = `<i class="swatch" style="background:${BANDS[L.c%12]}"></i>` +
+      `${L.terms.join(' · ')} <span style="color:var(--ink-soft)">${
+        Math.round(100*L.size/n)}%</span>`;
+    b.onclick = () => { hidden.has(L.c) ? hidden.delete(L.c) : hidden.add(L.c);
+                        renderClusters(); draw(); renderStream(); };
+    el.clusters.appendChild(b);
+  });
+}
+
+// Streamgraph: field share by week. This is the view that answers
+// "how did my interests shift" — and it is the screenshot people share.
+function renderStream(){
+  const svg = el.stream; svg.innerHTML = '';
+  if (!S) return;
+  const W = svg.clientWidth || 900, H = 118;
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  const WEEK = 7*864e5;
+  const days = S.pages.map(p => p.last);
+  const min = Math.min(...days), max = Math.max(...days);
+  const nb = Math.max(2, Math.min(120, Math.ceil((max-min)/WEEK)));
+  const k = S.labels.length;
+  const bins = [...Array(nb)].map(()=>new Float64Array(k));
+  S.pages.forEach((p,i) => {
+    if (hidden.has(S.lab[i])) return;
+    const b = Math.min(nb-1, Math.floor((p.last-min)/(max-min+1)*nb));
+    bins[b][S.lab[i]] += p.n;
+  });
+  const totals = bins.map(b => b.reduce((a,v)=>a+v,0));
+  const peak = Math.max(...totals, 1);
+  const order = S.labels.map((L,c)=>c).filter(c=>!hidden.has(c))
+    .sort((a,b)=>S.labels[b].size-S.labels[a].size);
+  const x = b => 4 + b*(W-8)/(nb-1);
+  const pad = 14;
+  let base = new Float64Array(nb);
+  const ns = 'http://www.w3.org/2000/svg';
+  for (const c of order){
+    const top = bins.map((b,i)=>base[i]+b[c]);
+    let d = `M ${x(0)} ${H-pad-base[0]/peak*(H-2*pad)}`;
+    for (let i=1;i<nb;i++) d += ` L ${x(i)} ${H-pad-base[i]/peak*(H-2*pad)}`;
+    for (let i=nb-1;i>=0;i--) d += ` L ${x(i)} ${H-pad-top[i]/peak*(H-2*pad)}`;
+    const p = document.createElementNS(ns,'path');
+    p.setAttribute('d', d+' Z'); p.setAttribute('fill', BANDS[c%12]);
+    p.setAttribute('fill-opacity','0.78');
+    p.appendChild(Object.assign(document.createElementNS(ns,'title'),
+      { textContent: S.labels[c].terms.join(' · ') }));
+    svg.appendChild(p);
+    base = top;
+  }
+  const fmt = t => new Date(t).toISOString().slice(0,7);
+  [[4,'start'],[W-4,'end']].forEach(([px,anchor],i)=>{
+    const t = document.createElementNS(ns,'text');
+    t.setAttribute('x',px); t.setAttribute('y',H-2);
+    t.setAttribute('text-anchor',anchor);
+    t.setAttribute('style','font:10px ui-monospace,monospace;fill:#5C5E5C');
+    t.textContent = fmt(i?max:min); svg.appendChild(t);
+  });
+}
+
+function showDetail(i){
+  const p = S.pages[i];
+  const key = S.sess.urlToSession.get(p.url);
+  const list = (S.sess.sessions.get(key) || []).slice(0,14);
+  const d = new Date(p.last).toISOString().slice(0,10);
+  el.detail.innerHTML =
+    `<div style="margin-bottom:6px"><b>${esc(p.title)}</b></div>` +
+    `<div style="color:var(--ink-soft);margin-bottom:8px">${esc(p.host)} · ` +
+    `${p.n} visit${p.n>1?'s':''} · last ${d} · field: ` +
+    `${S.labels[S.lab[i]].terms.join(' · ')}</div>` +
+    `<div style="color:var(--ink-soft);margin-bottom:4px">trail (${S.sess.mode}):</div>` +
+    `<ol>${list.map(v => `<li${v.url===p.url?' style="font-weight:600"':''}>${
+      esc(v.title.slice(0,58))}</li>`).join('')}</ol>`;
+}
+const esc = s => s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+// ───────────────────────────────────────────────────── 6. orchestration
+let raw = null, file = null;
+
+async function ingest(f){
+  file = f;
+  say('reading sqlite…');
+  try {
+    raw = await readHistory(f);
+  } catch (e){
+    el.explog.innerHTML = `<span class="err">${esc(e.message)}</span>`;
+    say('failed'); $('#run').disabled = true; return;
+  }
+  const ds = raw.pages.map(p=>p.last);
+  const span = [Math.min(...ds), Math.max(...ds)].map(t=>new Date(t).toISOString().slice(0,10));
+  el.explog.textContent =
+    `plate      ${f.name} · ${(f.size/1048576).toFixed(1)} MB\n` +
+    `schema     ${raw.flavor}\n` +
+    `visits     ${nf(raw.visits.length)}\n` +
+    `pages      ${nf(raw.pages.length)}  (${
+      (raw.visits.length/raw.pages.length).toFixed(1)} visits/page)\n` +
+    `interval   ${span[0]} … ${span[1]}\n` +
+    `hosts      ${nf(new Set(raw.pages.map(p=>p.host)).size)}`;
+  el.drop.style.display = 'none';
+  $('#run').disabled = false;
+  say('ready — develop plate');
+}
+
+async function develop(){
+  const cap = Math.max(500, +$('#cap').value|0);
+  const k = Math.min(12, Math.max(4, +$('#k').value|0));
+  const mode = $('#vec').value;
+  $('#run').disabled = true;
+  hidden = new Set(); selI = hoverI = -1;
+  el.detail.textContent = 'Click a point to read its trail.';
+
+  // Sample the most-visited pages when over cap: attention-weighted, not random.
+  const all = [...raw.pages].sort((a,b) => b.n - a.n || b.last - a.last);
+  const pages = all.slice(0, cap);
+  const n = pages.length;
+  const marks = {};
+
+  try {
+    say(`embedding 0/${nf(n)}…`);
+    let t = t0();
+    const vecs = mode === 'lexical'
+      ? lexicalVectors(pages)
+      : await minilmVectors(pages, done => say(`embedding ${nf(done)}/${nf(n)}…`));
+    marks.embed = t0()-t;
+
+    const sess = sessionize(raw.visits);
+
+    t = t0();
+    const lab = kmeans(vecs.V, n, vecs.dim, k);
+    const labels = labelClusters(pages, lab, k);
+    marks.cluster = t0()-t;
+
+    t = t0();
+    const sil = silhouette(vecs.V, n, vecs.dim, lab, k);
+    marks.sil = t0()-t;
+
+    say('projecting…');
+    t = t0();
+    const P = randomProject(vecs.V, n, vecs.dim, 64);
+    const nb = await knn(P, n, 64, 15, i => say(`neighbours ${nf(i)}/${nf(n)}…`));
+    marks.knn = t0()-t;
+
+    S = { X:new Float32Array(n*2), n, lab, labels, pages, sess, revealed:0 };
+    fitView(S.X, n);
+    t = t0();
+    const epochs = 90;
+    S.X = await layout(nb, n, epochs, (e, X) => {
+      S.X = X; S.revealed = Math.round(n * (e+1)/epochs);   // plate develops
+      if (e % 3 === 0){ fitView(X,n); draw(); say(`developing ${e+1}/${epochs}`); }
+    });
+    marks.layout = t0()-t;
+    S.revealed = n;
+    fitView(S.X, n); draw(); renderClusters(); renderStream();
+
+    el.metrics.innerHTML = [
+      ['emulsion', vecs.label],
+      ['pages plotted', nf(n) + (all.length>n ? ` / ${nf(all.length)}` : '')],
+      ['silhouette (cos)', isNaN(sil) ? '—' : sil.toFixed(3)],
+      ['fields', k],
+      ['sessions', nf(sess.sessions.size)],
+      ['session basis', sess.mode],
+      ['embed', `${(marks.embed/1000).toFixed(1)} s`],
+      ['kNN', `${(marks.knn/1000).toFixed(1)} s`],
+      ['layout', `${(marks.layout/1000).toFixed(1)} s`],
+    ].map(([a,b]) => `<span>${a}</span><span>${b}</span>`).join('');
+    say(`done · ${((marks.embed+marks.knn+marks.layout)/1000).toFixed(1)} s total`);
+  } catch (e){
+    console.error(e);
+    el.metrics.innerHTML = `<span class="err">${esc(e.message)}</span><span></span>`;
+    say('failed — see measurements');
+  }
+  $('#run').disabled = false;
+}
+
+// ─────────────────────────────────────────────────────────── events
+$('#pick').onclick = () => $('#file').click();
+$('#file').onchange = e => e.target.files[0] && ingest(e.target.files[0]);
+$('#run').onclick = develop;
+for (const ev of ['dragenter','dragover']) el.drop.addEventListener(ev, e => {
+  e.preventDefault(); el.drop.classList.add('over'); });
+el.drop.addEventListener('dragleave', () => el.drop.classList.remove('over'));
+document.addEventListener('drop', e => {
+  e.preventDefault(); el.drop.classList.remove('over');
+  const f = e.dataTransfer.files[0]; if (f) ingest(f);
+});
+document.addEventListener('dragover', e => e.preventDefault());
+
+el.plate.addEventListener('mousemove', e => {
+  const r = el.plate.getBoundingClientRect();
+  const mx = e.clientX-r.left, my = e.clientY-r.top;
+  if (drag){ view.x += mx-drag.x; view.y += my-drag.y; drag = {x:mx,y:my}; draw(); return; }
+  const i = nearest(mx,my);
+  if (i !== hoverI){ hoverI = i; draw(); }
+  if (i < 0){ el.tip.style.opacity = 0; return; }
+  const p = S.pages[i];
+  el.tip.innerHTML = `${esc(p.title.slice(0,90))}<br><span class="h">${esc(p.host)} · ${
+    p.n} visit${p.n>1?'s':''} · ${S.labels[S.lab[i]].terms.join(' · ')}</span>`;
+  el.tip.style.opacity = 1;
+  el.tip.style.left = Math.min(mx+14, view.w-340)+'px';
+  el.tip.style.top  = Math.min(my+14, view.h-70)+'px';
+});
+el.plate.addEventListener('mouseleave', ()=>{ el.tip.style.opacity=0; hoverI=-1; draw(); });
+el.plate.addEventListener('click', e => {
+  const r = el.plate.getBoundingClientRect();
+  const i = nearest(e.clientX-r.left, e.clientY-r.top);
+  if (i >= 0){ selI = i; showDetail(i); draw(); }
+});
+let drag = null;
+el.plate.addEventListener('mousedown', e => {
+  const r = el.plate.getBoundingClientRect();
+  drag = { x:e.clientX-r.left, y:e.clientY-r.top }; });
+addEventListener('mouseup', ()=> drag = null);
+el.plate.addEventListener('wheel', e => {
+  e.preventDefault();
+  const f = Math.exp(-e.deltaY*0.0015);
+  view.z = Math.max(0.4, Math.min(40, view.z*f));
+  draw();
+}, { passive:false });
+addEventListener('resize', ()=>{ draw(); renderStream(); });
+draw();
+</script>
+</body>
+</html>
